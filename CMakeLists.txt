@@ -22,7 +22,7 @@ target_compile_options(hellokitty PRIVATE
     -Wall
     -Wextra
     -Wno-unused-parameter # Seastar usa [[maybe_unused]] pero a veces hay warnings
-    # Agrega aquí otras flags que Seastar pueda necesitar o recomendar
+
 )
 
 # Seastar recomienda ciertas flags de compilación
@@ -30,7 +30,7 @@ target_compile_options(beanstar_server PRIVATE
     -Wall
     -Wextra
     -Wno-unused-parameter # Seastar usa [[maybe_unused]] pero a veces hay warnings
-    # Agrega aquí otras flags que Seastar pueda necesitar o recomendar
+    
 )
 
 
