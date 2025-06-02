@@ -23,6 +23,10 @@
 #include <functional> // For std::function
 #include <algorithm>  // For std::find
 
+
+
+#define STALKD_SERVER 11300
+
 // Global logger
 seastar::logger applog("beanstar_daemon");
 
@@ -912,7 +916,7 @@ public:
 int main(int argc, char** argv) {
     seastar::app_template app;
     app.add_options()
-        ("port", boost::program_options::value<uint16_t>()->default_value(11300), "Beanstalkd port");
+        ("port", boost::program_options::value<uint16_t>()->default_value(STALKD_PORT), "Beanstalkd port");
 
     return app.run(argc, argv, [&app]() -> seastar::future<> {
         auto& config = app.configuration();
