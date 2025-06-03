@@ -1,0 +1,25 @@
+name: Build beanstar_server
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y g++ libboost-all-dev
+
+    - name: Compile beanstar_server.cpp
+      run: |
+        mkdir -p build
+        g++ -std=c++17 -O2 -o build/beanstar_server src/beanstar_server.cpp -lboost_system -lpthread
