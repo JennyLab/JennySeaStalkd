@@ -1,0 +1,37 @@
+name: Build beanstar_server
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y g++ ninja-build cmake libboost-all-dev ragel libfmt-dev libhwloc-dev libnuma-dev libxml2-dev
+
+    - name: Clone Seastar
+      run: |
+        git clone --depth 1 --branch v23.03 https://github.com/scylladb/seastar.git
+        cd seastar
+        ./install-dependencies.sh
+        cmake -H. -Bbuild -GNinja -DCMAKE_BUILD_TYPE=Release
+        ninja -C build
+        cd ..
+
+    - name: Build beanstar_server
+      run: |
+        mkdir -p build
+        g++ -std=c++20 -O2 -Iseastar/include -Iseastar/build/_deps/fmt-src/include \
+          -Lseastar/build/release \
+          -o build/beanstar_server src/beanstar_server.cpp \
+          -lseastar -lboost_system -lfmt -lpthread -lxml2 -lstdc++fs -ldl -lrt -lhwloc -lnuma
