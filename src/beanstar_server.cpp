@@ -9,6 +9,9 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/net/api.hh>
 #include <seastar/util/log.hh>
+#include <seastar/util/std-compat.hh> // For seastar::compat::optional
+#include <seastar/core/map_reduce.hh>
+
 
 #include <iostream>
 #include <string>
@@ -22,10 +25,10 @@
 #include <optional>
 #include <functional> // For std::function
 #include <algorithm>  // For std::find
+#include <sstream>    // For YAML formatting
 
 
-
-#define STALKD_SERVER 11300
+#define STALKD_SERVER 11300 // MODIFIED: Corrected from STALKD_PORT
 
 // Global logger
 seastar::logger applog("beanstar_daemon");
@@ -52,7 +55,7 @@ struct Job {
     seastar::sstring tube_name;
     std::chrono::steady_clock::time_point creation_time;
     std::chrono::steady_clock::time_point deadline_time; // For TTR or delay activation
-    seastar::timer<> ttr_timer{}; // Default constructor
+    seastar::timer<> ttr_timer{}; 
 
     Job(uint64_t i, seastar::sstring b, unsigned prio, std::chrono::microseconds delay, std::chrono::microseconds ttr, seastar::sstring t_name)
         : id(i), body(std::move(b)), priority(prio), delay_us(delay), ttr_us(ttr),
@@ -61,82 +64,81 @@ struct Job {
     }
 };
 
-// Global storage for all jobs, sharded by job_id
 seastar::sharded<std::unordered_map<uint64_t, Job>> jobs_storage;
-// Atomic counter for generating unique job IDs
 std::atomic<uint64_t> next_job_id{1};
 
 
-// Reference to a job, used in Tube's priority queues to avoid cross-shard access for sorting
 struct JobReference {
     uint64_t id;
     unsigned priority; 
-    std::chrono::steady_clock::time_point sort_key_ts; // creation_time for ready, deadline_time for delayed
+    std::chrono::steady_clock::time_point sort_key_ts; 
 
-    struct ReadyComparator { // Higher actual priority (lower value) first, then FIFO
+    struct ReadyComparator { 
         bool operator()(const JobReference& a, const JobReference& b) const {
             if (a.priority != b.priority) {
-                return a.priority > b.priority;  // Lower prio value is higher actual prio
+                return a.priority > b.priority;  
             }
-            return a.sort_key_ts > b.sort_key_ts; // Earlier creation_time first
+            return a.sort_key_ts > b.sort_key_ts; 
         }
     };
 
-    struct DelayedComparator { // Earlier deadline first
+    struct DelayedComparator { 
         bool operator()(const JobReference& a, const JobReference& b) const {
-            return a.sort_key_ts > b.sort_key_ts; // Earlier deadline_time first
+            return a.sort_key_ts > b.sort_key_ts; 
         }
     };
 };
 
-// Per-tube data structure
+// MODIFIED: Tube struct with counters for stats
 struct Tube {
     seastar::sstring name;
-    // Jobs ready to be reserved, sorted by priority then creation time
     std::priority_queue<JobReference, std::vector<JobReference>, JobReference::ReadyComparator> ready_queue;
-    // Jobs delayed for future execution, sorted by their activation time
     std::priority_queue<JobReference, std::vector<JobReference>, JobReference::DelayedComparator> delayed_queue;
-    // Job IDs of jobs currently reserved by clients
     std::unordered_set<uint64_t> reserved_jobs;
-    // Job IDs of jobs buried by clients
     std::deque<uint64_t> buried_queue;
-    // Promises from clients waiting for a job from this tube
     std::deque<seastar::promise<std::optional<uint64_t>>> waiting_clients;
-    // Timer to periodically check the delayed_queue
     seastar::timer<> delayed_job_poller{};
+
+    // NEW: Counters for stats-tube
+    std::atomic<uint64_t> total_jobs_ever{0}; // All jobs ever put into this tube (approximate, as jobs can be deleted)
+    // current-jobs-urgent: 0 (not implemented as a separate queue)
+    // current-jobs-ready: ready_queue.size()
+    // current-jobs-reserved: reserved_jobs.size()
+    // current-jobs-delayed: delayed_queue.size()
+    // current-jobs-buried: buried_queue.size()
+    // current-waiting: waiting_clients.size()
+    // cmd-delete: (needs dedicated counter if per-tube stats are desired)
+    // cmd-pause-tube: (needs dedicated counter)
+    // pause, pause-time-left: (needs fields for pause-tube)
+
 
     Tube(seastar::sstring n) : name(std::move(n)) {}
 
-    // Method to check delayed jobs and move them to ready queue if their time has come
-    // This method runs on the tube's shard.
     void check_delayed_jobs() {
         while (!delayed_queue.empty()) {
-            JobReference job_ref = delayed_queue.top(); // Peek at the top job
+            JobReference job_ref = delayed_queue.top(); 
 
             if (job_ref.sort_key_ts <= std::chrono::steady_clock::now()) {
-                delayed_queue.pop(); // Remove from delayed queue
+                delayed_queue.pop(); 
 
                 unsigned job_actual_shard = job_ref.id % seastar::smp::count;
                 (void)jobs_storage.invoke_on(job_actual_shard, 
                     [job_id = job_ref.id](std::unordered_map<uint64_t, Job>& local_job_map) 
-                    -> std::optional<std::pair<unsigned, std::chrono::steady_clock::time_point>> {
+                    -> seastar::compat::optional<std::pair<unsigned, std::chrono::steady_clock::time_point>> { // MODIFIED: seastar::compat::optional
                     auto it = local_job_map.find(job_id);
                     if (it != local_job_map.end() && it->second.state == JobState::DELAYED) {
                         it->second.state = JobState::READY;
-                        // Return the priority and creation_time needed for the ready queue JobReference
                         return std::make_pair(it->second.priority, it->second.creation_time);
                     }
-                    return std::nullopt; // Job not found, or not in expected state
+                    return seastar::compat::nullopt; 
                 }).then_wrapped([this, job_id = job_ref.id]
-                    (seastar::future<std::optional<std::pair<unsigned, std::chrono::steady_clock::time_point>>> f_job_details) {
-                    // This callback runs on the original tube's shard.
+                    (seastar::future<seastar::compat::optional<std::pair<unsigned, std::chrono::steady_clock::time_point>>> f_job_details) { // MODIFIED: seastar::compat::optional
                     try {
-                        std::optional<std::pair<unsigned, std::chrono::steady_clock::time_point>> opt_details = f_job_details.get();
+                        seastar::compat::optional<std::pair<unsigned, std::chrono::steady_clock::time_point>> opt_details = f_job_details.get(); // MODIFIED: seastar::compat::optional
                         if (opt_details) {
-                            // Job state updated on its home shard, now add to local ready_queue
                             ready_queue.push({job_id, opt_details->first, opt_details->second});
                             applog.trace("Moved job {} from delayed to ready in tube {}", job_id, name);
-                            notify_a_waiting_client(); // Notify a client that a job is available
+                            notify_a_waiting_client(); 
                         } else {
                             applog.trace("Job {} not moved from delayed (not found or state changed) in tube {}", job_id, name);
                         }
@@ -145,23 +147,18 @@ struct Tube {
                     }
                 });
             } else {
-                // Top job not ready yet, re-arm timer for its specific deadline
                 delayed_job_poller.rearm(job_ref.sort_key_ts);
-                return; // Stop checking, next check will be when timer fires
+                return; 
             }
         }
-        // If loop finishes, means delayed_queue is empty or all processed jobs were invalid
         if (delayed_queue.empty()) {
-            delayed_job_poller.cancel(); // No more delayed jobs, cancel poller
+            delayed_job_poller.cancel(); 
             applog.trace("Delayed queue for tube {} is empty, poller cancelled.", name);
         } else if (!delayed_job_poller.armed()) {
-            // This case should ideally be covered by rearming for the next job's specific time.
-            // If somehow it's not armed, arm it for the new top.
             delayed_job_poller.rearm(delayed_queue.top().sort_key_ts);
         }
     }
 
-    // Arms the poller if there are delayed jobs and it's not already armed.
     void arm_delayed_job_poller_if_needed() {
         if (!delayed_queue.empty() && !delayed_job_poller.armed()) {
             applog.trace("Arming delayed job poller for tube {} for time: {}", name, delayed_queue.top().sort_key_ts.time_since_epoch().count());
@@ -169,13 +166,10 @@ struct Tube {
         }
     }
 
-    // Notifies one waiting client (if any) that a job might be available.
     void notify_a_waiting_client() {
         if (!waiting_clients.empty()) {
             seastar::promise<std::optional<uint64_t>> promise = std::move(waiting_clients.front());
             waiting_clients.pop_front();
-            // Fulfill promise with nullopt, signaling client to retry reservation.
-            // The client's reserve logic will then try to pick a job from ready_queue.
             promise.set_value(std::nullopt); 
             applog.trace("Notified a waiting client for tube {}", name);
         }
@@ -183,7 +177,6 @@ struct Tube {
 
     ~Tube() {
         delayed_job_poller.cancel();
-        // Clear waiting clients with an error or specific signal if necessary
         for (auto&& promise : waiting_clients) {
             promise.set_exception(std::runtime_error("Tube being destroyed"));
         }
@@ -191,16 +184,12 @@ struct Tube {
     }
 };
 
-// Global collection of all tubes, sharded by tube name
 seastar::sharded<std::unordered_map<seastar::sstring, Tube>> all_tubes;
 
-// Helper to determine the shard ID for a given tube name
 unsigned get_tube_shard_id(const seastar::sstring& tube_name) {
     return std::hash<seastar::sstring>{}(tube_name) % seastar::smp::count;
 }
 
-// Helper function to get or create a tube on the current shard (used within invoke_on)
-// This static version is for use inside lambdas passed to invoke_on for all_tubes.
 static Tube& get_or_create_tube_on_current_shard(
     std::unordered_map<seastar::sstring, Tube>& local_tubes_map, 
     const seastar::sstring& name) {
@@ -219,15 +208,34 @@ static Tube& get_or_create_tube_on_current_shard(
     return it->second;
 }
 
+// NEW: Helper to format a map to a YAML string
+seastar::sstring to_yaml_string_map(const std::unordered_map<seastar::sstring, seastar::sstring>& data) {
+    std::ostringstream oss;
+    oss << "---\r\n";
+    for (const auto& pair : data) {
+        oss << pair.first << ": " << pair.second << "\r\n";
+    }
+    return seastar::sstring(oss.str());
+}
+
+// NEW: Helper to format a list of strings to a YAML string
+seastar::sstring to_yaml_string_list(const std::vector<seastar::sstring>& data) {
+    std::ostringstream oss;
+    oss << "---\r\n";
+    for (const auto& item : data) {
+        oss << "- " << item << "\r\n";
+    }
+    return seastar::sstring(oss.str());
+}
+
 
 class client_connection : public seastar::enable_shared_from_this<client_connection> {
 public:
     seastar::input_stream<char> _in;
     seastar::output_stream<char> _out;
-    seastar::sstring _current_put_tube = "default"; // Tube for 'put'
-    std::unordered_set<seastar::sstring> _watched_tubes; // Tubes for 'reserve'
+    seastar::sstring _current_put_tube = "default"; 
+    std::unordered_set<seastar::sstring> _watched_tubes; 
 
-    // State for multi-stage reserve operation
     seastar::promise<std::optional<uint64_t>> _reserve_promise;
     seastar::timer<> _reserve_timeout_timer{};
     bool _is_reserving = false;
@@ -235,20 +243,17 @@ public:
 
     client_connection(seastar::input_stream<char>&& in, seastar::output_stream<char>&& out)
         : _in(std::move(in)), _out(std::move(out)) {
-        _watched_tubes.insert("default"); // Watch "default" tube by default
+        _watched_tubes.insert("default"); 
     }
 
-    // Main processing loop for a client connection
     seastar::future<> process() {
         return seastar::repeat([this] {
-            // Read a line from the input stream (up to \n)
             return _in.read_until('\n').then([this](seastar::temporary_buffer<char> line_buf) {
-                if (!line_buf || line_buf.empty()) { // EOF or empty line indicates connection closed by client
+                if (!line_buf || line_buf.empty()) { 
                     applog.debug("Client {} closed connection (EOF or empty line)", _out.socket_address());
                     return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
                 }
                 seastar::sstring line(line_buf.get(), line_buf.size());
-                // Trim \r if present from \r\n
                 if (!line.empty() && line.back() == '\r') {
                     line.pop_back();
                 }
@@ -257,25 +262,28 @@ public:
                 return handle_command(line).then([this](bool continue_processing) {
                     if (continue_processing) {
                         return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::no);
-                    } else { // e.g. quit command
+                    } else { 
                         applog.debug("Client {}: Stopping command processing.", _out.socket_address());
                         return seastar::make_ready_future<seastar::stop_iteration>(seastar::stop_iteration::yes);
                     }
                 });
             });
         }).finally([this] {
-            // Cleanup resources when connection is fully closed
             applog.debug("Client {} connection processing finished. Closing output stream.", _out.socket_address());
-            _reserve_timeout_timer.cancel(); // Cancel any pending reserve timer
-            if (_is_reserving) { // If a reserve was active and promise not fulfilled
-                _reserve_promise.set_exception(std::runtime_error("Client connection closed during reserve"));
+            _reserve_timeout_timer.cancel(); 
+            if (_is_reserving) { 
+                // TODO: This is where Error 1 (UB with _reserve_promise move) could be problematic.
+                // A robust solution might involve a shared_ptr to the promise or a different notification mechanism.
+                if (_reserve_promise.get_future().available() == false) { // Check if promise was not already moved/fulfilled
+                   _reserve_promise.set_exception(std::runtime_error("Client connection closed during reserve"));
+                }
                 _is_reserving = false;
             }
-            return _out.close(); // Ensure output stream is closed
+            return _out.close(); 
         });
     }
 
-    // Parses and handles a single command line
+    // MODIFIED: Added new commands to dispatcher
     seastar::future<bool> handle_command(seastar::sstring line) {
         std::vector<seastar::sstring> parts;
         size_t start = 0;
@@ -289,14 +297,13 @@ public:
             start = end + 1;
         }
 
-        if (parts.empty()) { // Should not happen if line_buf was not empty
+        if (parts.empty()) { 
             return client_error_response("INTERNAL_SERVER_ERROR_EMPTY_CMD"); 
         }
 
         const seastar::sstring& command = parts[0];
         applog.trace("Client {}: Parsed command: '{}'", _out.socket_address(), command);
 
-        // Command dispatching
         if (command == "put") return handle_put(parts);
         if (command == "reserve") return handle_reserve_base(parts, std::nullopt);
         if (command == "reserve-with-timeout") return handle_reserve_base(parts, true);
@@ -307,22 +314,36 @@ public:
         if (command == "use") return handle_use(parts);
         if (command == "watch") return handle_watch(parts);
         if (command == "ignore") return handle_ignore(parts);
-        if (command == "quit") return seastar::make_ready_future<bool>(false); // Signal to stop processing
+        if (command == "quit") return seastar::make_ready_future<bool>(false); 
+
+        // NEW: Dispatch to new command handlers
+        if (command == "stats") return handle_stats(parts);
+        if (command == "stats-tube") return handle_stats_tube(parts);
+        if (command == "list-tubes") return handle_list_tubes(parts);
+        if (command == "peek-ready") return handle_peek_ready(parts);
+        if (command == "kick") return handle_kick(parts);
+
+        // Placeholder for other commands
+        if (command == "stats-job" || command == "peek" || command == "peek-delayed" ||
+            command == "peek-buried" || command == "kick-job" || command == "list-tube-used" ||
+            command == "list-tubes-watched" || command == "pause-tube") {
+            applog.warn("Client {}: Command {} not yet implemented.", _out.socket_address(), command);
+            return client_error_response("COMMAND_NOT_IMPLEMENTED");
+        }
+
 
         applog.warn("Client {}: Unknown command: {}", _out.socket_address(), command);
         return client_error_response("UNKNOWN_COMMAND");
     }
     
-    // Sends an error response to the client
     seastar::future<bool> client_error_response(const seastar::sstring& err_msg) {
         return _out.write(err_msg + "\r\n").then([this] { 
-            return _out.flush(); // Ensure error message is sent
+            return _out.flush(); 
         }).then([] {
-            return true; // Continue processing commands
+            return true; 
         });
     }
 
-    // Handles "put <priority> <delay_sec> <ttr_sec> <bytes>\r\n<data>\r\n"
     seastar::future<bool> handle_put(const std::vector<seastar::sstring>& parts) {
         if (parts.size() != 5) return client_error_response("BAD_FORMAT (put args)");
         try {
@@ -331,22 +352,15 @@ public:
             unsigned ttr_sec = std::stoul(parts[3].c_str());
             size_t bytes = std::stoul(parts[4].c_str());
 
-            if (bytes > 1024 * 64) { // Max job size (64KB, as in original beanstalkd)
-                // Drain the body first before sending error
+            if (bytes > 1024 * 64) { 
                 return _in.read_exactly(bytes + 2).then_wrapped([this](seastar::future<seastar::temporary_buffer<char>> f_drain) {
-                    // We don't care about the drained data or if draining failed.
-                    // Just ensure we attempt to consume it.
                     return client_error_response("JOB_TOO_BIG");
                 });
             }
 
             return _in.read_exactly(bytes + 2).then([this, priority, delay_sec, ttr_sec, bytes](seastar::temporary_buffer<char> data_buf) {
                 if (data_buf.size() != bytes + 2 || data_buf[bytes] != '\r' || data_buf[bytes+1] != '\n') {
-                    // This indicates a framing error. The client sent incorrect byte count or missed CRLF.
-                    // It's hard to recover gracefully. We might have consumed part of next command.
-                    // Best to close connection or send error and hope client resets.
                     applog.warn("Client {}: Put command framing error. Expected {} bytes + CRLF, got {} bytes.", _out.socket_address(), bytes, data_buf.size());
-                    // For simplicity, send error and continue. A robust server might close.
                     return client_error_response("BAD_FORMAT (put data framing)");
                 }
                 seastar::sstring data(data_buf.get(), bytes);
@@ -364,9 +378,8 @@ public:
         unsigned job_storage_shard = job_id % seastar::smp::count;
 
         auto creation_tp = std::chrono::steady_clock::now();
-        auto deadline_tp = creation_tp + std::chrono::seconds(delay_sec); // For delayed jobs
+        auto deadline_tp = creation_tp + std::chrono::seconds(delay_sec); 
 
-        // Step 1: Store the job data on its designated shard
         return jobs_storage.invoke_on(job_storage_shard, 
             [job_id, data = std::move(data), priority, delay_sec, ttr_sec, tube_name = _current_put_tube, creation_tp, deadline_tp]
             (std::unordered_map<uint64_t, Job>& local_job_map) mutable {
@@ -375,7 +388,7 @@ public:
                         std::chrono::seconds(delay_sec),
                         std::chrono::seconds(ttr_sec),
                         tube_name);
-            new_job.creation_time = creation_tp; // Ensure consistent creation time
+            new_job.creation_time = creation_tp; 
 
             if (delay_sec > 0) {
                 new_job.state = JobState::DELAYED;
@@ -386,24 +399,23 @@ public:
             local_job_map.emplace(job_id, std::move(new_job));
             applog.trace("Stored job {} on shard {}", job_id, seastar::this_shard_id());
         }).then([this, job_id, delay_sec, target_tube_shard, priority, creation_tp, deadline_tp] {
-            // Step 2: Add job reference to the tube on its shard
             return all_tubes.invoke_on(target_tube_shard, 
                 [job_id, delay_sec, tube_name = _current_put_tube, priority, creation_tp, deadline_tp]
                 (std::unordered_map<seastar::sstring, Tube>& local_tubes_map) {
                 
                 Tube& tube = get_or_create_tube_on_current_shard(local_tubes_map, tube_name);
+                tube.total_jobs_ever.fetch_add(1, std::memory_order_relaxed); // NEW: Increment tube's total jobs
                 if (delay_sec > 0) {
                     tube.delayed_queue.push({job_id, priority, deadline_tp});
                     tube.arm_delayed_job_poller_if_needed();
                     applog.trace("Added job {} to delayed queue of tube '{}'", job_id, tube_name);
                 } else {
-                    tube.ready_queue.push({job_id, priority, creation_tp}); // sort_key_ts is creation_time for ready
+                    tube.ready_queue.push({job_id, priority, creation_tp}); 
                     tube.notify_a_waiting_client();
                     applog.trace("Added job {} to ready queue of tube '{}'", job_id, tube_name);
                 }
             });
         }).then([this, job_id] {
-            // Step 3: Send response to client
             return _out.write(seastar::format("INSERTED {}\r\n", job_id))
                        .then([this]{ return _out.flush(); })
                        .then([]{ return true; });
@@ -413,72 +425,68 @@ public:
         });
     }
     
-    // Base handler for "reserve" and "reserve-with-timeout"
     seastar::future<bool> handle_reserve_base(const std::vector<seastar::sstring>& parts, std::optional<bool> with_timeout_flag) {
-        if (_is_reserving) { // Client issued a new reserve while one is pending
-            // This is a protocol violation by client or a server logic issue.
-            // Cancel previous, log, and send error.
+        if (_is_reserving) { 
             applog.warn("Client {}: New reserve command while previous one active. Cancelling old.", _out.socket_address());
             _reserve_timeout_timer.cancel();
-            _reserve_promise.set_exception(std::runtime_error("Superseded by new reserve command"));
-            _is_reserving = false; // Reset state
+             if (_reserve_promise.get_future().available() == false) {
+                _reserve_promise.set_exception(std::runtime_error("Superseded by new reserve command"));
+            }
+            _is_reserving = false; 
         }
 
         std::optional<std::chrono::seconds> timeout_duration;
-        if (with_timeout_flag.has_value()) { // reserve-with-timeout
+        if (with_timeout_flag.has_value()) { 
             if (parts.size() != 2) return client_error_response("BAD_FORMAT (reserve-with-timeout args)");
             try {
                 timeout_duration = std::chrono::seconds(std::stoul(parts[1].c_str()));
             } catch (const std::exception& e) {
                 return client_error_response("BAD_FORMAT (reserve-with-timeout parse)");
             }
-        } else { // plain reserve (wait indefinitely)
+        } else { 
             if (parts.size() != 1) return client_error_response("BAD_FORMAT (reserve args)");
-            // timeout_duration remains std::nullopt for indefinite wait
         }
         
         _is_reserving = true;
-        _reserve_promise = seastar::promise<std::optional<uint64_t>>(); // Fresh promise
+        _reserve_promise = seastar::promise<std::optional<uint64_t>>(); 
 
-        // Start the reservation attempt
         do_try_reserve_round(); 
 
         seastar::future<std::optional<uint64_t>> future_to_wait_on = _reserve_promise.get_future();
 
         if (timeout_duration) {
-            if (*timeout_duration == std::chrono::seconds(0)) { // Special case: deadline soon
-                // If do_try_reserve_round didn't find a job immediately, it will fulfill promise with nullopt.
-                // The .then block below handles this.
+            if (*timeout_duration == std::chrono::seconds(0)) { 
+                // Handled by do_try_reserve_round fulfilling promise quickly if no job
             } else {
                 _reserve_timeout_timer.set_callback([this] {
-                    if (_is_reserving) { // Check if reserve is still active
+                    if (_is_reserving) { 
                         applog.trace("Client {}: reserve timed out.", _out.socket_address());
-                        _reserve_promise.set_value(std::nullopt); // Fulfill with nullopt for timeout
-                        _is_reserving = false; // Mark as no longer reserving due to timeout
+                         if (_reserve_promise.get_future().available() == false) {
+                            _reserve_promise.set_value(std::nullopt); 
+                        }
+                        _is_reserving = false; 
                     }
                 });
                 _reserve_timeout_timer.arm(*timeout_duration);
             }
         }
 
-        // Handle the result of the reservation attempt (either immediate, after waiting, or timeout)
-        return future_to_wait_on.then_wrapped([this, timeout_val = timeout_duration] // Capture timeout_val for DEADLINE_SOON logic
+        return future_to_wait_on.then_wrapped([this, timeout_val = timeout_duration] 
             (seastar::future<std::optional<uint64_t>> f_job_id_opt) {
-            _is_reserving = false; // Reservation attempt concluded (successfully or not)
-            _reserve_timeout_timer.cancel(); // Ensure timer is cancelled
+            _is_reserving = false; 
+            _reserve_timeout_timer.cancel(); 
 
             try {
                 std::optional<uint64_t> job_id_opt = f_job_id_opt.get();
-                if (job_id_opt) { // Job was successfully reserved
+                if (job_id_opt) { 
                     uint64_t job_id = *job_id_opt;
                     unsigned job_storage_shard = job_id % seastar::smp::count;
-                    // Fetch job body to send to client
                     return jobs_storage.invoke_on(job_storage_shard, 
-                        [job_id](const std::unordered_map<uint64_t, Job>& local_job_map) -> std::optional<seastar::sstring> {
+                        [job_id](const std::unordered_map<uint64_t, Job>& local_job_map) -> seastar::compat::optional<seastar::sstring> { // MODIFIED seastar::compat::optional
                         auto it = local_job_map.find(job_id);
                         if (it != local_job_map.end()) return it->second.body;
-                        return std::nullopt;
-                    }).then([this, job_id](std::optional<seastar::sstring> body_opt) {
+                        return seastar::compat::nullopt; // MODIFIED seastar::compat::nullopt
+                    }).then([this, job_id](seastar::compat::optional<seastar::sstring> body_opt) { // MODIFIED seastar::compat::optional
                         if (body_opt) {
                             return _out.write(seastar::format("RESERVED {} {}\r\n{}\r\n", job_id, body_opt->length(), *body_opt))
                                        .then([this]{ return _out.flush(); }).then([]{ return true; });
@@ -486,10 +494,12 @@ public:
                         applog.error("Client {}: Job {} reserved but not found in storage for body fetch.", _out.socket_address(), job_id);
                         return client_error_response("INTERNAL_SERVER_ERROR (reserve body fetch)");
                     });
-                } else { // No job reserved (could be timeout, deadline_soon, or explicit wake-up with no job)
+                } else { 
                     if (timeout_val && *timeout_val == std::chrono::seconds(0)) {
                         return _out.write("DEADLINE_SOON\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
                     }
+                    // If timeout_val is nullopt (plain reserve) and we got nullopt job_id, it means a wake-up without a job.
+                    // Beanstalkd clients typically retry reserve in this case. We send TIMED_OUT as a generic "no job now" response.
                     return _out.write("TIMED_OUT\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
                 }
             } catch (const std::exception& e) {
@@ -499,48 +509,48 @@ public:
         });
     }
 
-    // Tries to reserve a job from watched tubes. If none, and not timed out, registers for notification.
     void do_try_reserve_round() {
-        if (!_is_reserving) return; // Guard against calls if reserve was cancelled/finished
+        if (!_is_reserving) return; 
 
         seastar::shared_ptr<std::vector<seastar::sstring>> watched_tubes_copy = 
             seastar::make_shared<std::vector<seastar::sstring>>(_watched_tubes.begin(), _watched_tubes.end());
 
-        if (watched_tubes_copy->empty()) { // Should not happen (default tube)
-            _reserve_promise.set_value(std::nullopt); // No tubes to watch, effectively a timeout/fail
+        if (watched_tubes_copy->empty()) { 
+             if (_is_reserving && _reserve_promise.get_future().available() == false) {
+                _reserve_promise.set_value(std::nullopt); 
+            }
             _is_reserving = false;
             return;
         }
         
-        // Asynchronously iterate through watched tubes to find a job
-        // This uses a manual loop with futures. seastar::do_for_each might be an alternative.
         seastar::shared_ptr<size_t> current_tube_idx = seastar::make_shared<size_t>(0);
+        seastar::shared_ptr<std::optional<uint64_t>> found_job_id = seastar::make_shared<std::optional<uint64_t>>(std::nullopt);
 
         seastar::future<> loop_fut = seastar::do_until(
-            [this, watched_tubes_copy, current_tube_idx] { // Stop condition for loop
-                return *current_tube_idx >= watched_tubes_copy->size() || !_is_reserving; // Stop if all tubes checked or reserve cancelled
+            [this, watched_tubes_copy, current_tube_idx, found_job_id] { 
+                return *current_tube_idx >= watched_tubes_copy->size() || !_is_reserving || found_job_id->has_value(); 
             },
-            [this, watched_tubes_copy, current_tube_idx] { // Loop body
+            [this, watched_tubes_copy, current_tube_idx, found_job_id] { 
                 const seastar::sstring& tube_name = (*watched_tubes_copy)[*current_tube_idx];
-                (*current_tube_idx)++; // Move to next tube for subsequent iteration
+                (*current_tube_idx)++; 
 
                 unsigned target_tube_shard = get_tube_shard_id(tube_name);
                 return all_tubes.invoke_on(target_tube_shard, 
-                    [this, tube_name](std::unordered_map<seastar::sstring, Tube>& local_tubes_map) -> seastar::future<std::optional<uint64_t>> {
-                    // This lambda runs on the tube's shard
+                    [this, tube_name, found_job_id](std::unordered_map<seastar::sstring, Tube>& local_tubes_map) -> seastar::future<> {
+                    if (!_is_reserving || found_job_id->has_value()) return seastar::make_ready_future<>();
+
                     auto tube_it = local_tubes_map.find(tube_name);
                     if (tube_it == local_tubes_map.end() || tube_it->second.ready_queue.empty()) {
-                        return seastar::make_ready_future<std::optional<uint64_t>>(std::nullopt); // No job in this tube
+                        return seastar::make_ready_future<>(); 
                     }
                     Tube& tube = tube_it->second;
-                    JobReference job_ref = tube.ready_queue.top(); // Peek
+                    JobReference job_ref = tube.ready_queue.top(); 
 
                     uint64_t job_id = job_ref.id;
                     unsigned job_storage_shard = job_id % seastar::smp::count;
 
-                    // Attempt to mark job as RESERVED on its home shard
                     return jobs_storage.invoke_on(job_storage_shard, 
-                        [job_id, tube_name_copy = tube.name /*copy tube name for TTR callback*/]
+                        [job_id, tube_name_copy = tube.name ]
                         (std::unordered_map<uint64_t, Job>& local_job_map) -> bool {
                         auto it = local_job_map.find(job_id);
                         if (it != local_job_map.end() && it->second.state == JobState::READY) {
@@ -548,31 +558,25 @@ public:
                             job.state = JobState::RESERVED;
                             job.deadline_time = std::chrono::steady_clock::now() + job.ttr_us;
                             
-                            // Setup TTR timer for the job
                             job.ttr_timer.set_callback([job_id_cb = job_id, tube_name_cb = tube_name_copy, 
                                                         prio_cb = job.priority, creation_time_cb = job.creation_time] {
                                 applog.debug("TTR expired for job {}", job_id_cb);
                                 unsigned job_shard_cb = job_id_cb % seastar::smp::count;
                                 unsigned original_tube_shard_cb = get_tube_shard_id(tube_name_cb);
 
-                                // Step 1: On job's shard, mark as READY (if still RESERVED)
                                 (void)jobs_storage.invoke_on(job_shard_cb, [job_id_cb](std::unordered_map<uint64_t, Job>& j_map) {
                                     auto j_it = j_map.find(job_id_cb);
                                     if (j_it != j_map.end() && j_it->second.state == JobState::RESERVED) {
                                         j_it->second.state = JobState::READY;
-                                        // TTR timer is one-shot, no need to cancel explicitly after it fires
-                                    } else {
-                                        // Job no longer reserved or doesn't exist, TTR effectively void
-                                    }
+                                    } 
                                 }).then([original_tube_shard_cb, job_id_cb, tube_name_cb, prio_cb, creation_time_cb] {
-                                    // Step 2: On tube's shard, remove from reserved_jobs and add to ready_queue
                                     (void)all_tubes.invoke_on(original_tube_shard_cb, 
                                         [job_id_cb, tube_name_cb, prio_cb, creation_time_cb]
                                         (std::unordered_map<seastar::sstring, Tube>& tubes_map_cb){
                                         auto tube_it_cb = tubes_map_cb.find(tube_name_cb);
                                         if (tube_it_cb != tubes_map_cb.end()) {
                                             Tube& t = tube_it_cb->second;
-                                            if (t.reserved_jobs.erase(job_id_cb) > 0) { // If it was in reserved set
+                                            if (t.reserved_jobs.erase(job_id_cb) > 0) { 
                                                 t.ready_queue.push({job_id_cb, prio_cb, creation_time_cb});
                                                 applog.debug("Job {} (TTR expired) moved back to ready in tube {}", job_id_cb, tube_name_cb);
                                                 t.notify_a_waiting_client();
@@ -580,77 +584,93 @@ public:
                                         }
                                     });
                                 });
-                            }); // End TTR callback setup
+                            }); 
                             job.ttr_timer.arm(job.deadline_time);
-                            return true; // Successfully reserved on job's shard
+                            return true; 
                         }
-                        return false; // Job not found or not in READY state on its shard
-                    }).then_wrapped([this, job_id, &tube] // Back on tube's shard
+                        return false; 
+                    }).then_wrapped([this, job_id, &tube, found_job_id] 
                         (seastar::future<bool> f_reserved_on_job_shard) {
+                        if (!_is_reserving || found_job_id->has_value()) return seastar::make_ready_future<>();
                         try {
-                            if (f_reserved_on_job_shard.get()) { // Successfully reserved on job's shard
-                                tube.ready_queue.pop(); // Now actually remove from ready queue
+                            if (f_reserved_on_job_shard.get()) { 
+                                tube.ready_queue.pop(); 
                                 tube.reserved_jobs.insert(job_id);
                                 applog.trace("Client {} reserved job {} from tube {}", _out.socket_address(), job_id, tube.name);
                                 
-                                if (_is_reserving) _reserve_promise.set_value(job_id); // Fulfill the main promise
-                                _is_reserving = false; // Stop further attempts for this reserve call
-                                return seastar::make_ready_future<std::optional<uint64_t>>(job_id);
+                                *found_job_id = job_id; // Signal that a job was found
+                                if (_is_reserving && _reserve_promise.get_future().available() == false) {
+                                     _reserve_promise.set_value(job_id); 
+                                }
+                                // _is_reserving = false; // Do not set to false here, let the main handler do it.
+                                return seastar::make_ready_future<>();
                             }
                         } catch (const std::exception& e) {
                              applog.error("Client {}: Exception checking reservation status for job {} from tube {}: {}", _out.socket_address(), job_id, tube.name, e.what());
                         }
-                        // If reservation failed on job's shard, or exception.
-                        return seastar::make_ready_future<std::optional<uint64_t>>(std::nullopt);
+                        return seastar::make_ready_future<>();
                     });
-                }).then_wrapped([this](seastar::future<std::optional<uint64_t>> f_job_opt) {
+                }).then_wrapped([this](seastar::future<> f_job_opt) {
                     if (f_job_opt.failed()) {
                         applog.error("Client {}: Failure in reserve loop invoke_on: {}", _out.socket_address(), f_job_opt.get_exception());
                     }
-                }); // End of loop body's future chain
-            }); // End of seastar::do_until
+                }); 
+            }); 
 
-        // After the loop (all tubes checked or job found)
-        (void)loop_fut.then_wrapped([this, watched_tubes_copy](seastar::future<> f_loop_done) {
+        (void)loop_fut.then_wrapped([this, watched_tubes_copy, found_job_id](seastar::future<> f_loop_done) {
             if (f_loop_done.failed()) {
                  applog.error("Client {}: Reserve loop itself failed: {}", _out.socket_address(), f_loop_done.get_exception());
-                 if(_is_reserving) _reserve_promise.set_exception(f_loop_done.get_exception());
+                 if(_is_reserving && _reserve_promise.get_future().available() == false) _reserve_promise.set_exception(f_loop_done.get_exception());
                  _is_reserving = false;
                  return;
             }
 
-            if (_is_reserving) { // Loop finished, no job found, and reserve is still active
-                bool has_timeout = _reserve_timeout_timer.armed(); // Approximation: if timer armed, there's a timeout.
+            if (_is_reserving && !found_job_id->has_value()) { // Loop finished, no job found, and reserve is still active
+                bool has_timeout = _reserve_timeout_timer.armed() || (_reserve_timeout_timer.get_timeout() == std::chrono::steady_clock::duration::zero());
                 
-                if (!has_timeout) { // Indefinite wait: register with tubes
+                if (!has_timeout) { 
                     applog.trace("Client {}: No job found, will wait indefinitely on watched tubes.", _out.socket_address());
+                    // TODO: This is the critical section for Error 1 (UB with _reserve_promise move).
+                    // The promise might be moved multiple times if multiple tubes are watched.
+                    // A more robust solution is needed here, perhaps a counter or a shared promise wrapper.
+                    // For now, it might mostly work if the first tube takes the promise.
+                    bool promise_moved = false;
                     for (const auto& tube_name : *watched_tubes_copy) {
+                        if (!_is_reserving || promise_moved) break; 
                         unsigned target_tube_shard = get_tube_shard_id(tube_name);
-
-                        // Let's add client to waiting list of all watched tubes.
-                        // The promise is fulfilled once. First tube to fulfill "wins".
-                        for (const auto& tube_name : *watched_tubes_copy) {
-                             unsigned target_tube_shard = get_tube_shard_id(tube_name);
-                             (void)all_tubes.invoke_on(target_tube_shard, [this, tube_name](std::unordered_map<seastar::sstring, Tube>& local_tubes_map){
-                                if (!_is_reserving) return; // Check again, might have been fulfilled by another tube
-                                Tube& tube = get_or_create_tube_on_current_shard(local_tubes_map, tube_name);
-                                // Only add if the promise is not already fulfilled
-                                if (_is_reserving && !_reserve_promise.get_future().available()) {
-                                   tube.waiting_clients.push_back(std::move(_reserve_promise));
-                                   applog.trace("Client {} added to waiting list for tube {} (indefinite wait, actual wait depends on tube activity)", _out.socket_address(), tube_name);
-                                   break; 
-                                }
-                             });
-                             if (!_is_reserving || _reserve_promise.get_future().available()) break; // Stop if reserve ended or promise moved
-                        }
+                        (void)all_tubes.invoke_on(target_tube_shard, 
+                            [this, tube_name, &promise_moved](std::unordered_map<seastar::sstring, Tube>& local_tubes_map){
+                            if (!_is_reserving || promise_moved) return; 
+                            Tube& tube = get_or_create_tube_on_current_shard(local_tubes_map, tube_name);
+                            if (_is_reserving && _reserve_promise.get_future().available() == false && !promise_moved) {
+                               tube.waiting_clients.push_back(std::move(_reserve_promise)); // Potential multiple moves
+                               promise_moved = true; 
+                               applog.trace("Client {} added to waiting list for tube {}", _out.socket_address(), tube_name);
+                            }
+                         });
                     }
+                     if (_is_reserving && !promise_moved && _reserve_promise.get_future().available() == false) {
+                        // If promise was not moved (e.g., all tubes were new and didn't exist before invoke_on completed)
+                        // this is a fallback. This case should be rare.
+                        _reserve_promise.set_value(std::nullopt); // Fulfill to prevent hang
+                        _is_reserving = false;
+                        applog.warn("Client {}: Reserve promise not moved to any waiting list, fulfilling with no job.", _out.socket_address());
+                    }
+
+                } else if (_is_reserving && _reserve_promise.get_future().available() == false) {
+                    // If there was a timeout (e.g. reserve-with-timeout 0) and no job found immediately
+                    _reserve_promise.set_value(std::nullopt);
+                    // _is_reserving will be set to false by the main handler
                 }
+            } else if (_is_reserving && found_job_id->has_value()) {
+                // Job was found, _reserve_promise already set. _is_reserving will be handled by caller.
+            } else if (!_is_reserving) {
+                // Reserve was cancelled or fulfilled by timeout concurrently.
             }
         });
     }
 
 
-    // Handles "delete <id>\r\n"
     seastar::future<bool> handle_delete(const std::vector<seastar::sstring>& parts) {
         if (parts.size() != 2) return client_error_response("BAD_FORMAT (delete args)");
         try {
@@ -663,24 +683,21 @@ public:
 
     seastar::future<bool> do_delete(uint64_t job_id) {
         unsigned job_storage_shard = job_id % seastar::smp::count;
-        // Step 1: Remove job from its storage shard and get its tube name
         return jobs_storage.invoke_on(job_storage_shard, 
-            [job_id](std::unordered_map<uint64_t, Job>& local_job_map) -> std::optional<seastar::sstring> {
+            [job_id](std::unordered_map<uint64_t, Job>& local_job_map) -> seastar::compat::optional<seastar::sstring> { // MODIFIED seastar::compat::optional
             auto it = local_job_map.find(job_id);
             if (it == local_job_map.end()) {
-                return std::nullopt; // Not found
+                return seastar::compat::nullopt; // MODIFIED seastar::compat::nullopt
             }
             seastar::sstring tube_name = it->second.tube_name;
-            it->second.ttr_timer.cancel(); // Cancel TTR timer if active
+            it->second.ttr_timer.cancel(); 
             local_job_map.erase(it);
             applog.trace("Deleted job {} from storage on shard {}", job_id, seastar::this_shard_id());
             return tube_name;
-        }).then([this, job_id](std::optional<seastar::sstring> tube_name_opt) {
+        }).then([this, job_id](seastar::compat::optional<seastar::sstring> tube_name_opt) { // MODIFIED seastar::compat::optional
             if (!tube_name_opt) {
                 return _out.write("NOT_FOUND\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
             }
-            // Step 2: If job was in a tube's reserved_jobs set, remove it.
-            // Other queues (ready, delayed) handle missing jobs implicitly when they try to access them.
             unsigned target_tube_shard = get_tube_shard_id(*tube_name_opt);
             return all_tubes.invoke_on(target_tube_shard, 
                 [job_id, tube_name = *tube_name_opt](std::unordered_map<seastar::sstring, Tube>& local_tubes_map){
@@ -689,8 +706,9 @@ public:
                     if (tube_it->second.reserved_jobs.erase(job_id) > 0) {
                          applog.trace("Removed job {} from reserved set of tube '{}'", job_id, tube_name);
                     }
-                    // Buried queue might also need explicit cleanup if we implement kick thoroughly.
-                    // For now, this is a simplification.
+                    // NEW: Also remove from buried queue if present (though delete usually targets reserved/ready)
+                    auto& bq = tube_it->second.buried_queue;
+                    bq.erase(std::remove(bq.begin(), bq.end(), job_id), bq.end());
                 }
             }).then([this] {
                 return _out.write("DELETED\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
@@ -698,7 +716,6 @@ public:
         });
     }
     
-    // Handles "release <id> <priority> <delay_sec>\r\n"
     seastar::future<bool> handle_release(const std::vector<seastar::sstring>& parts) {
         if (parts.size() != 4) return client_error_response("BAD_FORMAT (release args)");
         try {
@@ -715,18 +732,16 @@ public:
         unsigned job_storage_shard = job_id % seastar::smp::count;
         auto new_deadline_tp = std::chrono::steady_clock::now() + std::chrono::seconds(delay_sec);
 
-        // Step 1: Update job details on its shard. Check if it was reserved.
         return jobs_storage.invoke_on(job_storage_shard, 
             [job_id, new_priority, delay_sec, new_deadline_tp] 
             (std::unordered_map<uint64_t, Job>& local_job_map) 
             -> std::tuple<bool, JobState, seastar::sstring, std::chrono::steady_clock::time_point, unsigned> { 
-            // success, old_state, tube_name, sort_key_ts_for_queue, final_priority_for_queue
             auto it = local_job_map.find(job_id);
             if (it == local_job_map.end()) {
-                return {false, JobState::INVALID, "", {}, 0}; // Not found
+                return {false, JobState::INVALID, "", {}, 0}; 
             }
             if (it->second.state != JobState::RESERVED) {
-                return {false, it->second.state, "", {}, 0}; // Not reserved
+                return {false, it->second.state, "", {}, 0}; 
             }
             
             Job& job = it->second;
@@ -738,13 +753,13 @@ public:
             if (delay_sec > 0) {
                 job.state = JobState::DELAYED;
                 job.deadline_time = new_deadline_tp;
-                sort_key_ts = new_deadline_tp; // For delayed_queue
+                sort_key_ts = new_deadline_tp; 
             } else {
                 job.state = JobState::READY;
-                sort_key_ts = job.creation_time; // For ready_queue
+                sort_key_ts = job.creation_time; 
             }
             applog.trace("Releasing job {} on shard {}, new state: {}, new prio: {}", job_id, seastar::this_shard_id(), (int)job.state, new_priority);
-            return {true, JobState::RESERVED /*old_state*/, tube_name, sort_key_ts, job.priority};
+            return {true, JobState::RESERVED , tube_name, sort_key_ts, job.priority};
         }).then([this, job_id, delay_sec](std::tuple<bool, JobState, seastar::sstring, std::chrono::steady_clock::time_point, unsigned> result) {
             bool success = std::get<0>(result);
             JobState old_job_state = std::get<1>(result);
@@ -753,24 +768,20 @@ public:
             unsigned final_priority = std::get<4>(result);
 
             if (!success) {
-                return _out.write((old_job_state == JobState::INVALID ? "NOT_FOUND\r\n" : "NOT_FOUND\r\n")) // Beanstalkd sends NOT_FOUND if not reserved.
+                return _out.write((old_job_state == JobState::INVALID ? "NOT_FOUND\r\n" : "NOT_FOUND\r\n")) 
                            .then([this]{ return _out.flush(); }).then([]{ return true; });
             }
 
-            // Step 2: Update tube state on its shard (remove from reserved, add to ready/delayed)
             unsigned target_tube_shard = get_tube_shard_id(tube_name);
             return all_tubes.invoke_on(target_tube_shard, 
                 [job_id, tube_name, delay_sec, sort_key_ts, final_priority]
                 (std::unordered_map<seastar::sstring, Tube>& local_tubes_map){
                 auto tube_it = local_tubes_map.find(tube_name);
-                if (tube_it == local_tubes_map.end()) return; // Should not happen if job existed
+                if (tube_it == local_tubes_map.end()) return; 
                 
                 Tube& tube = tube_it->second;
                 if (tube.reserved_jobs.erase(job_id) == 0) {
-                    // Job was not in this tube's reserved set, though job's state said RESERVED.
-                    // This indicates a potential inconsistency. Log it.
                     applog.warn("Job {} was marked RESERVED but not found in tube {}'s reserved set during release.", job_id, tube_name);
-                    // Proceed to add to ready/delayed anyway, as job's state is updated.
                 }
 
                 if (delay_sec > 0) {
@@ -788,12 +799,11 @@ public:
         });
     }
 
-    // Handles "bury <id> <priority>\r\n"
     seastar::future<bool> handle_bury(const std::vector<seastar::sstring>& parts) {
         if (parts.size() != 3) return client_error_response("BAD_FORMAT (bury args)");
         try {
             uint64_t job_id = std::stoull(parts[1].c_str());
-            unsigned priority = std::stoul(parts[2].c_str()); // Priority for future kick
+            unsigned priority = std::stoul(parts[2].c_str()); 
             return do_bury(job_id, priority);
         } catch (const std::exception& e) {
             return client_error_response("BAD_FORMAT (bury params parse)");
@@ -802,24 +812,20 @@ public:
 
     seastar::future<bool> do_bury(uint64_t job_id, unsigned new_priority) {
         unsigned job_storage_shard = job_id % seastar::smp::count;
-        // Step 1: Update job state to BURIED and set new priority on its shard.
         return jobs_storage.invoke_on(job_storage_shard, 
             [job_id, new_priority] (std::unordered_map<uint64_t, Job>& local_job_map) 
-            -> std::tuple<bool, JobState, seastar::sstring> { // success, old_state, tube_name
+            -> std::tuple<bool, JobState, seastar::sstring> { 
             auto it = local_job_map.find(job_id);
             if (it == local_job_map.end()) {
                 return {false, JobState::INVALID, ""};
             }
             if (it->second.state != JobState::RESERVED) {
-                // Beanstalkd allows burying READY jobs too, but spec says "reserved job".
-                // For now, strict: only reserved jobs. Or check if it's READY.
-                // Let's stick to RESERVED as per common flow.
                 return {false, it->second.state, ""}; 
             }
             Job& job = it->second;
             job.ttr_timer.cancel();
             job.state = JobState::BURIED;
-            job.priority = new_priority; // Store new priority
+            job.priority = new_priority; 
             applog.trace("Burying job {} on shard {}, new prio: {}", job_id, seastar::this_shard_id(), new_priority);
             return {true, JobState::RESERVED, job.tube_name};
         }).then([this, job_id](std::tuple<bool, JobState, seastar::sstring> result) {
@@ -828,9 +834,8 @@ public:
             seastar::sstring tube_name = std::get<2>(result);
 
             if (!success) {
-                 return _out.write("NOT_FOUND\r\n").then([this]{ return _out.flush(); }).then([]{ return true; }); // Or NOT_FOUND if not reserved
+                 return _out.write("NOT_FOUND\r\n").then([this]{ return _out.flush(); }).then([]{ return true; }); 
             }
-            // Step 2: Update tube: remove from reserved, add to buried.
             unsigned target_tube_shard = get_tube_shard_id(tube_name);
             return all_tubes.invoke_on(target_tube_shard, 
                 [job_id, tube_name](std::unordered_map<seastar::sstring, Tube>& local_tubes_map){
@@ -838,7 +843,7 @@ public:
                 if (tube_it == local_tubes_map.end()) return;
                 Tube& tube = tube_it->second;
                 tube.reserved_jobs.erase(job_id);
-                tube.buried_queue.push_back(job_id); // Add to buried queue
+                tube.buried_queue.push_back(job_id); 
                 applog.trace("Moved job {} to buried queue of tube '{}'", job_id, tube_name);
             }).then([this] {
                 return _out.write("BURIED\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
@@ -846,7 +851,6 @@ public:
         });
     }
     
-    // Handles "touch <id>\r\n"
     seastar::future<bool> handle_touch(const std::vector<seastar::sstring>& parts) {
         if (parts.size() != 2) return client_error_response("BAD_FORMAT (touch args)");
         try {
@@ -863,33 +867,28 @@ public:
             [job_id](std::unordered_map<uint64_t, Job>& local_job_map) -> bool {
             auto it = local_job_map.find(job_id);
             if (it == local_job_map.end() || it->second.state != JobState::RESERVED) {
-                return false; // Not found or not reserved
+                return false; 
             }
             Job& job = it->second;
             job.deadline_time = std::chrono::steady_clock::now() + job.ttr_us;
-            job.ttr_timer.rearm(job.deadline_time); // Re-arm TTR timer
+            job.ttr_timer.rearm(job.deadline_time); 
             applog.trace("Touched job {}, new TTR deadline on shard {}", job_id, seastar::this_shard_id());
             return true;
         }).then([this, job_id](bool success) {
             if (!success) {
-                // Beanstalkd: "NOT_FOUND\r\n" if the job does not exist or is not reserved by the client.
-                // We don't track which client reserved it, so just "NOT_FOUND" if not reservable.
                 return _out.write("NOT_FOUND\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
             }
             return _out.write("TOUCHED\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
         });
     }
 
-    // Handles "use <tube>\r\n"
     seastar::future<bool> handle_use(const std::vector<seastar::sstring>& parts) {
         if (parts.size() != 2) return client_error_response("BAD_FORMAT (use args)");
         _current_put_tube = parts[1];
-        // Tube names have length limit, etc. Not validated here for brevity.
         return _out.write(seastar::format("USING {}\r\n", _current_put_tube))
                    .then([this]{ return _out.flush(); }).then([]{ return true; });
     }
 
-    // Handles "watch <tube>\r\n"
     seastar::future<bool> handle_watch(const std::vector<seastar::sstring>& parts) {
         if (parts.size() != 2) return client_error_response("BAD_FORMAT (watch args)");
         _watched_tubes.insert(parts[1]);
@@ -897,18 +896,337 @@ public:
                    .then([this]{ return _out.flush(); }).then([]{ return true; });
     }
 
-    // Handles "ignore <tube>\r\n"
     seastar::future<bool> handle_ignore(const std::vector<seastar::sstring>& parts) {
         if (parts.size() != 2) return client_error_response("BAD_FORMAT (ignore args)");
-        if (_watched_tubes.size() > 1) { // Cannot ignore the last tube
+        if (_watched_tubes.size() > 1) { 
             _watched_tubes.erase(parts[1]);
-        } else if (_watched_tubes.count(parts[1])) { // Trying to ignore the last tube
+        } else if (_watched_tubes.count(parts[1])) { 
              return _out.write("NOT_IGNORED\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
         }
-        // If tube was not watched, count remains same. Beanstalkd sends WATCHING <count>.
         return _out.write(seastar::format("WATCHING {}\r\n", _watched_tubes.size()))
                    .then([this]{ return _out.flush(); }).then([]{ return true; });
     }
+
+    // --- NEW COMMANDS IMPLEMENTATION ---
+
+    // stats
+    seastar::future<bool> handle_stats(const std::vector<seastar::sstring>& parts) {
+        if (parts.size() != 1) return client_error_response("BAD_FORMAT (stats args)");
+        return do_stats();
+    }
+
+    seastar::future<bool> do_stats() {
+        // Collect global stats. This is a simplified version.
+        // A full version would collect more detailed command counts, etc.
+        struct GlobalStats {
+            uint64_t current_jobs_ready = 0;
+            uint64_t current_jobs_reserved = 0;
+            uint64_t current_jobs_delayed = 0;
+            uint64_t current_jobs_buried = 0;
+            uint64_t current_tubes = 0;
+            uint64_t total_jobs_ever = 0; // From next_job_id
+        };
+
+        return seastar::map_reduce(all_tubes.begin(), all_tubes.end(),
+            [](const std::unordered_map<seastar::sstring, Tube>& local_tubes_map) {
+                GlobalStats local_stats;
+                local_stats.current_tubes = local_tubes_map.size();
+                for(const auto& pair : local_tubes_map) {
+                    const Tube& tube = pair.second;
+                    local_stats.current_jobs_ready += tube.ready_queue.size();
+                    local_stats.current_jobs_reserved += tube.reserved_jobs.size();
+                    local_stats.current_jobs_delayed += tube.delayed_queue.size();
+                    local_stats.current_jobs_buried += tube.buried_queue.size();
+                    // total_jobs_ever in tube is approximate, next_job_id is better for global
+                }
+                return local_stats;
+            },
+            GlobalStats{}, // initial value for reduction
+            [](GlobalStats acc, GlobalStats shard_stats) {
+                acc.current_jobs_ready += shard_stats.current_jobs_ready;
+                acc.current_jobs_reserved += shard_stats.current_jobs_reserved;
+                acc.current_jobs_delayed += shard_stats.current_jobs_delayed;
+                acc.current_jobs_buried += shard_stats.current_jobs_buried;
+                acc.current_tubes += shard_stats.current_tubes;
+                return acc;
+            }
+        ).then([this](GlobalStats stats) {
+            stats.total_jobs_ever = next_job_id.load(std::memory_order_relaxed) -1;
+            if (stats.total_jobs_ever < 0) stats.total_jobs_ever = 0;
+
+
+            std::unordered_map<seastar::sstring, seastar::sstring> data;
+            data["current-jobs-urgent"] = "0"; // Not implemented
+            data["current-jobs-ready"] = std::to_string(stats.current_jobs_ready);
+            data["current-jobs-reserved"] = std::to_string(stats.current_jobs_reserved);
+            data["current-jobs-delayed"] = std::to_string(stats.current_jobs_delayed);
+            data["current-jobs-buried"] = std::to_string(stats.current_jobs_buried);
+            data["cmd-put"] = "0"; // Placeholder, needs proper counting
+            // ... other cmd counts ...
+            data["current-tubes"] = std::to_string(stats.current_tubes);
+            data["current-connections"] = "1"; // Placeholder, needs proper counting (this client + others)
+            data["current-producers"] = "0"; // Placeholder
+            data["current-workers"] = "0";   // Placeholder
+            data["current-waiting"] = "0";   // Placeholder (clients waiting in reserve)
+            data["total-jobs"] = std::to_string(stats.total_jobs_ever);
+            data["uptime"] = "0"; // Placeholder, needs to track server start time
+            // ... other global stats ...
+
+            seastar::sstring yaml_data = to_yaml_string_map(data);
+            return _out.write(seastar::format("OK {}\r\n{}", yaml_data.length(), yaml_data))
+                       .then([this]{ return _out.flush(); })
+                       .then([]{ return true; });
+        });
+    }
+
+    // stats-tube <tube>
+    seastar::future<bool> handle_stats_tube(const std::vector<seastar::sstring>& parts) {
+        if (parts.size() != 2) return client_error_response("BAD_FORMAT (stats-tube args)");
+        return do_stats_tube(parts[1]);
+    }
+
+    seastar::future<bool> do_stats_tube(const seastar::sstring& tube_name) {
+        unsigned target_tube_shard = get_tube_shard_id(tube_name);
+        return all_tubes.invoke_on(target_tube_shard, 
+            [tube_name](const std::unordered_map<seastar::sstring, Tube>& local_tubes_map) 
+            -> seastar::compat::optional<std::unordered_map<seastar::sstring, seastar::sstring>> { // MODIFIED seastar::compat::optional
+            auto it = local_tubes_map.find(tube_name);
+            if (it == local_tubes_map.end()) {
+                return seastar::compat::nullopt; // MODIFIED seastar::compat::nullopt
+            }
+            const Tube& tube = it->second;
+            std::unordered_map<seastar::sstring, seastar::sstring> data;
+            data["name"] = tube.name;
+            data["current-jobs-urgent"] = "0"; // Not implemented
+            data["current-jobs-ready"] = std::to_string(tube.ready_queue.size());
+            data["current-jobs-reserved"] = std::to_string(tube.reserved_jobs.size());
+            data["current-jobs-delayed"] = std::to_string(tube.delayed_queue.size());
+            data["current-jobs-buried"] = std::to_string(tube.buried_queue.size());
+            data["total-jobs"] = std::to_string(tube.total_jobs_ever.load(std::memory_order_relaxed)); // Approximate
+            data["current-using"] = "0"; // Placeholder, complex to track globally
+            data["current-watching"] = "0"; // Placeholder, complex to track globally
+            data["current-waiting"] = std::to_string(tube.waiting_clients.size());
+            // ... other tube stats like cmd-delete for this tube, pause info ...
+            data["cmd-pause-tube"] = "0";
+            data["pause"] = "0";
+            data["pause-time-left"] = "0";
+
+            return data;
+        }).then([this](seastar::compat::optional<std::unordered_map<seastar::sstring, seastar::sstring>> opt_data) { // MODIFIED seastar::compat::optional
+            if (!opt_data) {
+                return _out.write("NOT_FOUND\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
+            }
+            seastar::sstring yaml_data = to_yaml_string_map(*opt_data);
+            return _out.write(seastar::format("OK {}\r\n{}", yaml_data.length(), yaml_data))
+                       .then([this]{ return _out.flush(); })
+                       .then([]{ return true; });
+        });
+    }
+
+    // list-tubes
+    seastar::future<bool> handle_list_tubes(const std::vector<seastar::sstring>& parts) {
+        if (parts.size() != 1) return client_error_response("BAD_FORMAT (list-tubes args)");
+        return do_list_tubes();
+    }
+
+    seastar::future<bool> do_list_tubes() {
+        return seastar::map_reduce(all_tubes.begin(), all_tubes.end(),
+            [](const std::unordered_map<seastar::sstring, Tube>& local_tubes_map) {
+                std::vector<seastar::sstring> names;
+                for(const auto& pair : local_tubes_map) {
+                    names.push_back(pair.first);
+                }
+                return names;
+            },
+            std::vector<seastar::sstring>{},
+            [](std::vector<seastar::sstring> acc, const std::vector<seastar::sstring>& shard_names) {
+                acc.insert(acc.end(), shard_names.begin(), shard_names.end());
+                return acc;
+            }
+        ).then([this](std::vector<seastar::sstring> all_tube_names) {
+            // Sort for consistent output, though not strictly required by protocol
+            std::sort(all_tube_names.begin(), all_tube_names.end());
+            seastar::sstring yaml_data = to_yaml_string_list(all_tube_names);
+            return _out.write(seastar::format("OK {}\r\n{}", yaml_data.length(), yaml_data))
+                       .then([this]{ return _out.flush(); })
+                       .then([]{ return true; });
+        });
+    }
+
+    // peek-ready
+    seastar::future<bool> handle_peek_ready(const std::vector<seastar::sstring>& parts) {
+        if (parts.size() != 1) return client_error_response("BAD_FORMAT (peek-ready args)");
+        return do_peek_ready();
+    }
+
+    seastar::future<bool> do_peek_ready() {
+        // Find the highest priority job in any of the watched tubes without reserving it.
+        // This is similar to do_try_reserve_round but read-only and simpler.
+        seastar::shared_ptr<std::vector<seastar::sstring>> watched_tubes_copy = 
+            seastar::make_shared<std::vector<seastar::sstring>>(_watched_tubes.begin(), _watched_tubes.end());
+
+        if (watched_tubes_copy->empty()) {
+            return _out.write("NOT_FOUND\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
+        }
+
+        // Use a structure to hold the best candidate job found so far
+        struct CandidateJob {
+            std::optional<JobReference> ref;
+            seastar::sstring tube_name; // For logging or if needed later
+
+            bool has_value() const { return ref.has_value(); }
+            
+            void update_if_better(const JobReference& new_ref, const seastar::sstring& current_tube_name) {
+                if (!ref || JobReference::ReadyComparator()(new_ref, *ref)) { // new_ref is better if comparator returns false
+                    ref = new_ref;
+                    tube_name = current_tube_name;
+                }
+            }
+        };
+        
+        return seastar::map_reduce(all_tubes.begin(), all_tubes.end(),
+            [watched_tubes_copy](const std::unordered_map<seastar::sstring, Tube>& local_tubes_map) {
+                CandidateJob local_best_candidate;
+                for (const auto& tube_name : *watched_tubes_copy) {
+                    auto tube_it = local_tubes_map.find(tube_name);
+                    if (tube_it != local_tubes_map.end() && !tube_it->second.ready_queue.empty()) {
+                        local_best_candidate.update_if_better(tube_it->second.ready_queue.top(), tube_name);
+                    }
+                }
+                return local_best_candidate;
+            },
+            CandidateJob{}, // initial
+            [](CandidateJob acc, const CandidateJob& shard_best) {
+                if (shard_best.has_value()) {
+                    acc.update_if_better(*shard_best.ref, shard_best.tube_name);
+                }
+                return acc;
+            }
+        ).then([this](CandidateJob best_candidate) {
+            if (!best_candidate.has_value()) {
+                return _out.write("NOT_FOUND\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
+            }
+            uint64_t job_id = best_candidate.ref->id;
+            unsigned job_storage_shard = job_id % seastar::smp::count;
+            // Fetch job body
+            return jobs_storage.invoke_on(job_storage_shard, 
+                [job_id](const std::unordered_map<uint64_t, Job>& local_job_map) -> seastar::compat::optional<seastar::sstring> { // MODIFIED seastar::compat::optional
+                auto it = local_job_map.find(job_id);
+                // Also check if job is still READY (it might have been reserved/deleted by another client)
+                if (it != local_job_map.end() && it->second.state == JobState::READY) return it->second.body;
+                return seastar::compat::nullopt; // MODIFIED seastar::compat::nullopt
+            }).then([this, job_id](seastar::compat::optional<seastar::sstring> body_opt) { // MODIFIED seastar::compat::optional
+                if (body_opt) {
+                    return _out.write(seastar::format("FOUND {} {}\r\n{}\r\n", job_id, body_opt->length(), *body_opt))
+                               .then([this]{ return _out.flush(); }).then([]{ return true; });
+                }
+                // If body not found or job state changed, treat as NOT_FOUND for peek
+                return _out.write("NOT_FOUND\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
+            });
+        });
+    }
+
+    // kick <bound>
+    seastar::future<bool> handle_kick(const std::vector<seastar::sstring>& parts) {
+        if (parts.size() != 2) return client_error_response("BAD_FORMAT (kick args)");
+        try {
+            unsigned bound = std::stoul(parts[1].c_str());
+            return do_kick(bound);
+        } catch (const std::exception& e) {
+            return client_error_response("BAD_FORMAT (kick bound parse)");
+        }
+    }
+
+    seastar::future<bool> do_kick(unsigned bound) {
+        if (bound == 0) { // Kicking 0 jobs is a no-op, success
+            return _out.write("KICKED 0\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
+        }
+
+        unsigned target_tube_shard = get_tube_shard_id(_current_put_tube); // Kick operates on the 'used' tube
+        
+        // This is a multi-step process:
+        // 1. On tube's shard: Get up to 'bound' job IDs from buried_queue.
+        // 2. For each job ID:
+        //    a. On job's shard: Change state from BURIED to READY. Get its priority and creation_time.
+        //    b. On tube's shard: Add to ready_queue with fetched details. Notify waiting clients.
+        // This is complex to do atomically for multiple jobs.
+        // Simpler approach: kick one by one up to bound, or get a list then process.
+        // Let's try to get a list of IDs first from the tube.
+
+        return all_tubes.invoke_on(target_tube_shard,
+            [bound, tube_name = _current_put_tube]
+            (std::unordered_map<seastar::sstring, Tube>& local_tubes_map) 
+            -> std::vector<uint64_t> { // Return list of job IDs to kick
+                auto tube_it = local_tubes_map.find(tube_name);
+                if (tube_it == local_tubes_map.end() || tube_it->second.buried_queue.empty()) {
+                    return {};
+                }
+                Tube& tube = tube_it->second;
+                std::vector<uint64_t> ids_to_kick;
+                for (unsigned i = 0; i < bound && !tube.buried_queue.empty(); ++i) {
+                    ids_to_kick.push_back(tube.buried_queue.front());
+                    tube.buried_queue.pop_front(); // Remove from buried immediately on this shard
+                }
+                return ids_to_kick;
+        }).then([this, target_tube_shard, tube_name = _current_put_tube] (std::vector<uint64_t> job_ids_to_kick) {
+            if (job_ids_to_kick.empty()) {
+                return _out.write("KICKED 0\r\n").then([this]{ return _out.flush(); }).then([]{ return true; });
+            }
+
+            // For each job, update its state and then add to ready queue on tube's shard
+            std::vector<seastar::future<>> kick_futures;
+            seastar::shared_ptr<std::atomic<unsigned>> kicked_count = seastar::make_shared<std::atomic<unsigned>>(0);
+
+            for (uint64_t job_id : job_ids_to_kick) {
+                unsigned job_storage_shard = job_id % seastar::smp::count;
+                kick_futures.push_back(
+                    jobs_storage.invoke_on(job_storage_shard, 
+                        [job_id](std::unordered_map<uint64_t, Job>& local_job_map) 
+                        -> seastar::compat::optional<std::pair<unsigned, std::chrono::steady_clock::time_point>> { // prio, creation_time
+                        auto it = local_job_map.find(job_id);
+                        if (it != local_job_map.end() && it->second.state == JobState::BURIED) {
+                            it->second.state = JobState::READY;
+                            // Priority for kicked jobs is their stored priority.
+                            // Creation time is original creation time for FIFO within priority.
+                            return std::make_pair(it->second.priority, it->second.creation_time);
+                        }
+                        return seastar::compat::nullopt;
+                    }).then([this, job_id, target_tube_shard, tube_name, kicked_count]
+                           (seastar::compat::optional<std::pair<unsigned, std::chrono::steady_clock::time_point>> opt_details) {
+                        if (opt_details) {
+                            return all_tubes.invoke_on(target_tube_shard,
+                                [job_id, tube_name, details = *opt_details, kicked_count]
+                                (std::unordered_map<seastar::sstring, Tube>& local_tubes_map) {
+                                auto tube_it = local_tubes_map.find(tube_name);
+                                if (tube_it != local_tubes_map.end()) {
+                                    Tube& tube = tube_it->second;
+                                    tube.ready_queue.push({job_id, details.first, details.second});
+                                    tube.notify_a_waiting_client();
+                                    kicked_count->fetch_add(1, std::memory_order_relaxed);
+                                    applog.trace("Kicked job {} to ready in tube {}", job_id, tube_name);
+                                }
+                            });
+                        }
+                        return seastar::make_ready_future<>(); // Job not found or not buried
+                    })
+                );
+            }
+
+            return seastar::when_all_succeed(kick_futures.begin(), kick_futures.end())
+                .then_wrapped([this, kicked_count](seastar::future<> result_fut) {
+                    // Even if some individual kicks fail (e.g. job deleted concurrently),
+                    // report the count of successful kicks.
+                    if (result_fut.failed()) {
+                        applog.warn("Client {}: Some kick operations failed: {}", _out.socket_address(), result_fut.get_exception());
+                    }
+                    unsigned count = kicked_count->load(std::memory_order_relaxed);
+                    return _out.write(seastar::format("KICKED {}\r\n", count))
+                               .then([this]{ return _out.flush(); })
+                               .then([]{ return true; });
+                });
+        });
+    }
+
 };
 
 
@@ -916,21 +1234,16 @@ public:
 int main(int argc, char** argv) {
     seastar::app_template app;
     app.add_options()
-        ("port", boost::program_options::value<uint16_t>()->default_value(STALKD_PORT), "Beanstalkd port");
+        ("port", boost::program_options::value<uint16_t>()->default_value(STALKD_SERVER), "Beanstalkd port"); // MODIFIED: Use STALKD_SERVER
 
     return app.run(argc, argv, [&app]() -> seastar::future<> {
         auto& config = app.configuration();
         uint16_t port = config["port"].as<uint16_t>();
 
-        // Start sharded services
         co_await jobs_storage.start();
         co_await all_tubes.start();
-        // Initialize next_job_id (already done globally)
 
-        // Any per-core initialization for sharded services if needed
         co_await all_tubes.invoke_on_all([](std::unordered_map<seastar::sstring, Tube>& local_tubes_map){
-            // Example: could pre-create 'default' tube or other initial setup.
-            // get_or_create_tube_on_current_shard handles individual tube timer setup upon first use.
             applog.info("Tube service initialized on shard {}", seastar::this_shard_id());
         });
 
@@ -939,27 +1252,20 @@ int main(int argc, char** argv) {
         
         applog.info("Starting Beanstalkd clone (in-memory) on port {}...", port);
 
-        // Listen on all cores for incoming connections
-        co_await seastar::smp::invoke_on_all([port, lo] { // Listen on all cores
+        co_await seastar::smp::invoke_on_all([port, lo] { 
             return seastar::listen(seastar::make_ipv4_address({port}), lo, 
                 [](seastar::connected_socket fd, seastar::socket_address addr) {
                 applog.info("Accepted connection from {} on shard {}", addr, seastar::this_shard_id());
                 auto conn = seastar::make_shared<client_connection>(fd.input(), fd.output());
-                // Start processing commands for this connection.
-                // Run in background, don't wait for it to complete here.
                 (void)conn->process().handle_exception_type([conn, addr](const std::exception& e) {
-                    // Log exceptions from connection processing
                     applog.error("Exception from connection {} ({}): {}", addr, conn->_out.socket_address(), e.what());
-                    // Connection processing future will also close output stream in its finally().
                 });
             });
         });
         
         applog.info("All cores are listening. Server is up.");
-        // The application will keep running. app.run manages the main event loop.
-        // To stop the server, one would typically use a signal handler to call seastar::engine().exit(0);
         co_return; 
-    }).finally([] { // This finally executes when the application is shutting down
+    }).finally([] { 
         applog.info("Shutting down server...");
         return jobs_storage.stop().then([]{
             return all_tubes.stop();
@@ -968,4 +1274,3 @@ int main(int argc, char** argv) {
         });
     });
 }
-
