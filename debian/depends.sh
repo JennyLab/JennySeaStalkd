@@ -27,7 +27,7 @@ apt-get upgrade -yqf 2>&1 1>>/dev/null && echo "[OK]" || echo "[ERROR]"
 echo -n "Install packages... "
 apt-get install -yqf ninja-build ragel libhwloc-dev libnuma-dev git libpciaccess-dev libprotobuf-dev protobuf-compiler \
     libcrypto++-dev libaio-dev libcap-dev libtool cmake g++ gcc libgnutls28-dev liblz4-dev libsctp-dev xfslibs-dev \
-    systemtap-sdt-dev libyaml-cpp-dev 2>&1 1>>/dev/null && echo "[OK]" || echo "[ERROR]"
+    systemtap-sdt-dev libyaml-cpp-dev valgrind 2>&1 1>>/dev/null && echo "[OK]" || echo "[ERROR]"
 
 sleep 2
 clear
