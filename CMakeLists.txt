@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Encuentra el paquete Seastar.
 # Es posible que necesites ajustar CMAKE_PREFIX_PATH si Seastar
 # no está instalado en una ruta estándar o no usaste `make install`.
-set(Seastar_DIR "/opt/seastar/build/release")
+set(Seastar_DIR "/opt/seastar/build/sanitize")
 find_package(Seastar REQUIRED)
 
 add_executable(hellokitty test_hellokitty.cpp)
